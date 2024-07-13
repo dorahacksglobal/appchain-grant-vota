@@ -57,4 +57,5 @@ sylvia = "0.8.1"
 thiserror = "1.0.44"
 
 [dev-dependencies]
-cw-multi-test = "0.18.0"
+cw-multi-test = "0.16.2"
+sylvia = {version = "0.8.1", features = ["mt"] }
