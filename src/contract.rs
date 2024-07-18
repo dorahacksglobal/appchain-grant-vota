@@ -3,10 +3,12 @@
 //! Version: 0.1.0
 //! License: Apache-2.0
 
+use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
-    coins, Addr, BankMsg, Deps, DepsMut, Empty, Env, Event, MessageInfo, Order, Response, StdError,
-    StdResult, Uint128,
+    coins, Addr, BankMsg, Deps, DepsMut, Env, Event, MessageInfo, Response, StdError, StdResult,
+    Uint128,
 };
+
 use cw_storage_plus::{Item, Map};
 use std::collections::HashMap;
 use sylvia::contract;
@@ -14,14 +16,33 @@ use sylvia::contract;
 #[cfg(not(feature = "library"))]
 use sylvia::entry_points;
 
-use crate::{error::ContractError, responses::AdminListResp};
+use crate::error::ContractError;
+
+#[cw_serde]
+pub struct Admin {
+    pub admin: Addr,
+}
+
+impl Admin {
+    pub fn is_admin(&self, addr: impl AsRef<str>) -> bool {
+        let addr = addr.as_ref();
+        self.admin.as_ref() == addr
+    }
+}
+
+#[cw_serde]
+pub struct InstantiateMsgData {
+    pub admin: Addr,
+    pub operator: Addr,
+    pub beneficiary: Addr,
+}
 
 pub struct AGContract<'a> {
-    pub(crate) admins: Map<'a, &'a Addr, Empty>,
+    pub(crate) admin: Item<'a, Admin>,
+    pub(crate) operator: Item<'a, Addr>,
     pub(crate) beneficiary: Item<'a, Addr>,
-    pub(crate) round_id: Item<'a, u64>,
-    pub(crate) projects: Map<'a, (&'a str, &'a str), HashMap<String, u128>>, // (round_id, project_id) -> {'arch':100, 'atom':20}
-    pub(crate) voters: Map<'a, (&'a str, &'a str, &'a Addr), HashMap<String, u128>>, // (round_id, project_id, voter) -> {'arch':100, 'atom':20}
+    pub(crate) projects: Map<'a, &'a str, HashMap<String, u128>>, // project_id -> {'arch':100, 'atom':20}
+    pub(crate) voters: Map<'a, (&'a str, &'a Addr), HashMap<String, u128>>, // (project_id, voter) -> {'arch':100, 'atom':20}
 }
 
 #[cfg_attr(not(feature = "library"), entry_points)]
@@ -30,9 +51,9 @@ pub struct AGContract<'a> {
 impl AGContract<'_> {
     pub const fn new() -> Self {
         Self {
-            admins: Map::new("admins"),
+            admin: Item::new("admin"),
+            operator: Item::new("operator"),
             beneficiary: Item::new("beneficiary"),
-            round_id: Item::new("round"),
             projects: Map::new("projects"),
             voters: Map::new("votes"),
         }
@@ -42,51 +63,55 @@ impl AGContract<'_> {
     pub fn instantiate(
         &self,
         ctx: (DepsMut, Env, MessageInfo),
-        admins: Vec<String>,
+        data: InstantiateMsgData,
     ) -> Result<Response, ContractError> {
-        let (deps, _, info) = ctx;
-
-        for admin in admins {
-            let admin = deps.api.addr_validate(&admin)?;
-            self.admins.save(deps.storage, &admin, &Empty {})?;
-        }
-        self.round_id.save(deps.storage, &1)?;
-        self.beneficiary.save(deps.storage, &info.sender)?;
+        let (deps, _, _) = ctx;
+        let InstantiateMsgData {
+            admin,
+            operator,
+            beneficiary,
+        } = data;
+        let admin = Admin { admin };
+        self.admin.save(deps.storage, &admin)?;
+        self.operator.save(deps.storage, &operator)?;
+        self.beneficiary.save(deps.storage, &beneficiary)?;
         Ok(Response::new())
     }
 
     // ============= Query ============= //
     #[msg(query)]
-    pub fn admin_list(&self, ctx: (Deps, Env)) -> StdResult<AdminListResp> {
+    pub fn admin(&self, ctx: (Deps, Env)) -> StdResult<Admin> {
         let (deps, _) = ctx;
 
-        let admins: Result<_, _> = self
-            .admins
-            .keys(deps.storage, None, None, Order::Ascending)
-            .map(|addr| addr.map(String::from))
-            .collect();
+        let admin = self.admin.load(deps.storage)?;
 
-        Ok(AdminListResp { admins: admins? })
+        Ok(admin)
     }
 
     #[msg(query)]
-    pub fn round_id(&self, ctx: (Deps, Env)) -> StdResult<u64> {
+    pub fn operator(&self, ctx: (Deps, Env)) -> StdResult<Addr> {
         let (deps, _) = ctx;
 
-        let round_id = self.round_id.may_load(deps.storage)?;
-        match round_id {
-            Some(round_id) => Ok(round_id),
-            None => Err(StdError::generic_err("Round not found")),
-        }
+        let operator = self.operator.load(deps.storage)?;
+
+        Ok(operator)
     }
 
     #[msg(query)]
-    pub fn project(&self, ctx: (Deps, Env), project_id: u64, round_id: u64) -> StdResult<HashMap<String, u128>> {
+    pub fn beneficiary(&self, ctx: (Deps, Env)) -> StdResult<Addr> {
         let (deps, _) = ctx;
-        let project = self.projects.may_load(
-            deps.storage,
-            (&round_id.to_string(), &project_id.to_string()),
-        )?;
+
+        let beneficiary = self.beneficiary.load(deps.storage)?;
+
+        Ok(beneficiary)
+    }
+
+    #[msg(query)]
+    pub fn project(&self, ctx: (Deps, Env), project_id: u64) -> StdResult<HashMap<String, u128>> {
+        let (deps, _) = ctx;
+        let project = self
+            .projects
+            .may_load(deps.storage, &project_id.to_string())?;
 
         match project {
             Some(project) => Ok(project),
@@ -98,16 +123,14 @@ impl AGContract<'_> {
     pub fn project_voter(
         &self,
         ctx: (Deps, Env),
-        round_id: u64,
         project_id: u64,
         voter: String,
     ) -> StdResult<HashMap<String, u128>> {
         let (deps, _) = ctx;
         let voter_addr = deps.api.addr_validate(&voter)?;
-        let voter = self.voters.may_load(
-            deps.storage,
-            (&round_id.to_string(), &project_id.to_string(), &voter_addr),
-        )?;
+        let voter = self
+            .voters
+            .may_load(deps.storage, (&project_id.to_string(), &voter_addr))?;
 
         match voter {
             Some(voter) => Ok(voter),
@@ -115,31 +138,45 @@ impl AGContract<'_> {
         }
     }
 
+    // Only admin can execute
+    fn is_admin(&self, deps: Deps, sender: &str) -> StdResult<bool> {
+        let admin = self.admin.load(deps.storage)?;
+        let can = admin.is_admin(&sender);
+        Ok(can)
+    }
+
+    // Only operator/admin can execute
+    fn is_operator(&self, deps: Deps, sender: &str) -> StdResult<bool> {
+        let admin = self.admin.load(deps.storage)?;
+        let can_admin = admin.is_admin(&sender);
+
+        let operator = self.operator.load(deps.storage)?;
+        let can_operator = sender.to_string() == operator.to_string();
+
+        let can = can_admin || can_operator;
+        Ok(can)
+    }
+
     // ============= Execute ============= //
     #[msg(exec)]
-    pub fn add_member(
+    pub fn change_operator(
         &self,
         ctx: (DepsMut, Env, MessageInfo),
-        admin: String,
+        address: Addr,
     ) -> Result<Response, ContractError> {
         let (deps, _, info) = ctx;
-        if !self.admins.has(deps.storage, &info.sender) {
+
+        if !self.is_admin(deps.as_ref(), info.sender.as_ref())? {
             return Err(ContractError::Unauthorized {
                 sender: info.sender,
             });
         }
 
-        let admin = deps.api.addr_validate(&admin)?;
-        if self.admins.has(deps.storage, &admin) {
-            return Err(ContractError::NoDupAddress { address: admin });
-        }
+        self.operator.save(deps.storage, &address)?;
 
-        self.admins.save(deps.storage, &admin, &Empty {})?;
-
-        let resp = Response::new()
-            .add_attribute("action", "add_member")
-            .add_event(Event::new("admin_added").add_attribute("addr", admin));
-        Ok(resp)
+        Ok(Response::new()
+            .add_attribute("action", "change_operator")
+            .add_attribute("address", address.to_string()))
     }
 
     #[msg(exec)]
@@ -149,7 +186,8 @@ impl AGContract<'_> {
         address: String,
     ) -> Result<Response, ContractError> {
         let (deps, _, info) = ctx;
-        if !self.admins.has(deps.storage, &info.sender) {
+
+        if !self.is_operator(deps.as_ref(), info.sender.as_ref())? {
             return Err(ContractError::Unauthorized {
                 sender: info.sender,
             });
@@ -176,7 +214,6 @@ impl AGContract<'_> {
         let coin = cw_utils::one_coin(&info)?;
         let denom = coin.denom;
 
-        let round_id = self.round_id.load(deps.storage)?;
         let mut total_amounts: u128 = 0;
 
         for (project_id, vote) in project_ids.iter().zip(amounts.iter()) {
@@ -184,10 +221,10 @@ impl AGContract<'_> {
             total_amounts += amount;
 
             // Update round project
-            let mut project = match self.projects.may_load(
-                deps.storage,
-                (&round_id.to_string(), &project_id.to_string()),
-            )? {
+            let mut project = match self
+                .projects
+                .may_load(deps.storage, &project_id.to_string())?
+            {
                 Some(project) => project,
                 None => HashMap::new(),
             };
@@ -199,17 +236,14 @@ impl AGContract<'_> {
                 project.insert(denom.clone(), amount);
             }
 
-            self.projects.save(
-                deps.storage,
-                (&round_id.to_string(), &project_id.to_string()),
-                &project,
-            )?;
+            self.projects
+                .save(deps.storage, &project_id.to_string(), &project)?;
 
             // Update round project voter
-            let mut voter = match self.voters.may_load(
-                deps.storage,
-                (&round_id.to_string(), &project_id.to_string(), &info.sender),
-            )? {
+            let mut voter = match self
+                .voters
+                .may_load(deps.storage, (&project_id.to_string(), &info.sender))?
+            {
                 Some(voter) => voter,
                 None => HashMap::new(),
             };
@@ -223,7 +257,7 @@ impl AGContract<'_> {
 
             self.voters.save(
                 deps.storage,
-                (&round_id.to_string(), &project_id.to_string(), &info.sender),
+                (&project_id.to_string(), &info.sender),
                 &voter,
             )?;
         }
@@ -248,7 +282,6 @@ impl AGContract<'_> {
             .add_event(
                 Event::new("batch_vote")
                     .add_attribute("sender", info.sender)
-                    .add_attribute("round_id", round_id.to_string())
                     .add_attribute(
                         "projects",
                         format!(
@@ -275,24 +308,6 @@ impl AGContract<'_> {
             );
         Ok(resp)
     }
-
-    #[msg(exec)]
-    pub fn end_round(&self, ctx: (DepsMut, Env, MessageInfo)) -> Result<Response, ContractError> {
-        let (deps, _, info) = ctx;
-        if !self.admins.has(deps.storage, &info.sender) {
-            return Err(ContractError::Unauthorized {
-                sender: info.sender,
-            });
-        }
-
-        let round_id = self.round_id.load(deps.storage)?;
-        self.round_id.save(deps.storage, &(round_id + 1))?;
-
-        let resp = Response::new()
-            .add_attribute("action", "end_round")
-            .add_event(Event::new("end_round").add_attribute("round_id", round_id.to_string()));
-        Ok(resp)
-    }
 }
 
 #[cfg(test)]
@@ -304,7 +319,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admin_list_query() {
+    fn admin_operator_beneficiary_query() {
         let mut deps = mock_dependencies();
         let env = mock_env();
 
@@ -313,24 +328,56 @@ mod tests {
             env.clone(),
             mock_info("sender", &[]),
             InstantiateMsg {
-                admins: vec!["admin1".to_owned(), "admin2".to_owned()],
+                data: InstantiateMsgData {
+                    admin: Addr::unchecked("admin"),
+                    operator: Addr::unchecked("operator"),
+                    beneficiary: Addr::unchecked("beneficiary"),
+                },
             },
         )
         .unwrap();
 
-        let msg = QueryMsg::AdminList {};
-        let resp = query(deps.as_ref(), env, ContractQueryMsg::AGContract(msg)).unwrap();
-        let resp: AdminListResp = from_json(&resp).unwrap();
+        let admin_addr: Admin = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Admin {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            resp,
-            AdminListResp {
-                admins: vec!["admin1".to_owned(), "admin2".to_owned()],
+            admin_addr,
+            Admin {
+                admin: Addr::unchecked("admin")
             }
         );
+
+        let operator_addr: Addr = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Operator {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(operator_addr, Addr::unchecked("operator"));
+
+        let beneficiary_addr: Addr = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Beneficiary {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(beneficiary_addr, Addr::unchecked("beneficiary"));
     }
 
     #[test]
-    fn add_member() {
+    fn change_operator() {
         let mut deps = mock_dependencies();
         let env = mock_env();
 
@@ -339,35 +386,105 @@ mod tests {
             env.clone(),
             mock_info("sender", &[]),
             InstantiateMsg {
-                admins: vec!["admin1".to_owned(), "admin2".to_owned()],
+                data: InstantiateMsgData {
+                    admin: Addr::unchecked("admin"),
+                    operator: Addr::unchecked("operator"),
+                    beneficiary: Addr::unchecked("beneficiary"),
+                },
             },
         )
         .unwrap();
 
-        let info = mock_info("admin1", &[]);
-        let msg = ExecMsg::AddMember {
-            admin: "admin3".to_owned(),
+        let admin_info = mock_info("admin", &[]);
+        let msg = ExecMsg::ChangeOperator {
+            address: Addr::unchecked("operator_changed"),
         };
         execute(
             deps.as_mut(),
             env.clone(),
-            info,
+            admin_info.clone(),
             ContractExecMsg::AGContract(msg),
         )
         .unwrap();
 
-        let msg = QueryMsg::AdminList {};
-        let resp = query(deps.as_ref(), env, ContractQueryMsg::AGContract(msg)).unwrap();
-        let resp: AdminListResp = from_json(&resp).unwrap();
+        let operator_changed_addr: Addr = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Operator {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(operator_changed_addr, Addr::unchecked("operator_changed"));
+
+        let no_access_info = mock_info("admin1", &[]);
+        let no_access_change_operator_error = execute(
+            deps.as_mut(),
+            env.clone(),
+            no_access_info.clone(),
+            ContractExecMsg::AGContract(ExecMsg::ChangeOperator {
+                address: Addr::unchecked("operator_changed"),
+            }),
+        )
+        .unwrap_err();
+
         assert_eq!(
-            resp,
-            AdminListResp {
-                admins: vec![
-                    "admin1".to_owned(),
-                    "admin2".to_owned(),
-                    "admin3".to_owned()
-                ],
-            }
+            no_access_change_operator_error,
+            ContractError::Unauthorized {
+                sender: no_access_info.clone().sender
+            },
+        );
+        let no_access_set_beneficiary_error = execute(
+            deps.as_mut(),
+            env.clone(),
+            no_access_info.clone(),
+            ContractExecMsg::AGContract(ExecMsg::SetBeneficiary {
+                address: "0x1a4B7626f3627EECf64b7beFFE599625080b28aA".to_string(),
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            no_access_set_beneficiary_error,
+            ContractError::Unauthorized {
+                sender: no_access_info.clone().sender
+            },
+        );
+
+        let inited_beneficiary_addr: Addr = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Beneficiary {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inited_beneficiary_addr, Addr::unchecked("beneficiary"));
+
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            admin_info.clone(),
+            ContractExecMsg::AGContract(ExecMsg::SetBeneficiary {
+                address: "dora1xuentny2lw3zx5rheevpudut0we3ghf3d4dm5p".to_string(),
+            }),
+        )
+        .unwrap();
+
+        let set_beneficiary_addr: Addr = from_json(
+            &query(
+                deps.as_ref(),
+                env.clone(),
+                ContractQueryMsg::AGContract(QueryMsg::Beneficiary {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            set_beneficiary_addr,
+            Addr::unchecked("dora1xuentny2lw3zx5rheevpudut0we3ghf3d4dm5p")
         );
     }
 
@@ -382,7 +499,11 @@ mod tests {
             env.clone(),
             mock_info("sender", &[]),
             InstantiateMsg {
-                admins: vec!["admin1".to_owned(), "admin2".to_owned()],
+                data: InstantiateMsgData {
+                    admin: Addr::unchecked("admin"),
+                    operator: Addr::unchecked("operator"),
+                    beneficiary: Addr::unchecked("beneficiary"),
+                },
             },
         )
         .unwrap();
@@ -437,17 +558,6 @@ mod tests {
                 amount: Uint128::from(160000u128),
             }],
         );
-        execute(
-            deps.as_mut(),
-            env.clone(),
-            info,
-            ContractExecMsg::AGContract(msg),
-        )
-        .unwrap();
-
-        // End round
-        let info = mock_info("admin1", &[]);
-        let msg = ExecMsg::EndRound {};
         execute(
             deps.as_mut(),
             env.clone(),
